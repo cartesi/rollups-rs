@@ -1,0 +1,48 @@
+# Opens the release pull request while changesets are pending, and publishes
+# the bumped crates once it is merged. See CONTRIBUTING.md#releasing.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'cartesi/rollups-rs'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write # push the release branch, tags and GitHub releases
+      pull-requests: write # open and update the release pull request
+      id-token: write # crates.io trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+
+      # Pending changesets mean this run only prepares the release pull
+      # request; without them, Sampo publishes whatever is unpublished.
+      - name: Authenticate to crates.io
+        id: crates-io
+        if: hashFiles('.sampo/changesets/*.md') == ''
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Release or publish
+        uses: bruits/sampo/crates/sampo-github-action@f7241754458e1be4073902b2860596340c7d089c # sampo-github-action-v0.15.4
+        with:
+          command: auto
+          cargo-token: ${{ steps.crates-io.outputs.token }}
+          create-github-release: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

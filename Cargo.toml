@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Cartesi and individual authors"]
+homepage = "https://github.com/cartesi/rollups-rs"
+repository = "https://github.com/cartesi/rollups-rs"
+
+[workspace.dependencies]
+# Workspace crates
+cartesi-codec = { version = "0.1.0", path = "crates/cartesi-codec" }
+cartesi-libcmt-sys = { version = "0.1.0", path = "crates/cartesi-libcmt-sys" }
+cartesi-rollup = { version = "0.1.0", path = "crates/cartesi-rollup" }
+
+# External crates
+alloy-primitives = "1"
+alloy-sol-types = "1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"

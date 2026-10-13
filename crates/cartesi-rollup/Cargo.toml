@@ -1,0 +1,21 @@
+[package]
+name = "cartesi-rollup"
+version = "0.1.0"
+description = "Safe Rust API for Cartesi Rollups applications running inside a Cartesi Machine"
+documentation = "https://docs.rs/cartesi-rollup"
+readme = "README.md"
+keywords = ["cartesi", "rollups", "libcmt", "riscv"]
+categories = ["api-bindings", "cryptography::cryptocurrencies"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+cartesi-codec.workspace = true
+cartesi-libcmt-sys.workspace = true
+
+[lints]
+workspace = true
