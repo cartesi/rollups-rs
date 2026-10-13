@@ -1,0 +1,29 @@
+[package]
+name = "cartesi-machine-sys"
+version = "0.21.0"
+description = "Raw FFI bindings to libcartesi, the Cartesi Machine emulator library"
+documentation = "https://docs.rs/cartesi-machine-sys"
+readme = "README.md"
+keywords = ["cartesi", "emulator", "risc-v", "ffi"]
+categories = ["external-ffi-bindings", "emulators"]
+links = "cartesi"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[features]
+# Link `libcartesi_jsonrpc.a`, the client for remote machines, instead of the
+# local emulator.
+remote_machine = []
+
+[dependencies]
+link-cplusplus = "1"
+
+[build-dependencies]
+bindgen = "0.72"
+
+[lints]
+workspace = true

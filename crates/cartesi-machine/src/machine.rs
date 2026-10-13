@@ -1,0 +1,1797 @@
+// (c) Cartesi and individual authors (see AUTHORS)
+// SPDX-License-Identifier: Apache-2.0 (see LICENSE)
+
+use std::{
+    ffi::{CStr, CString, c_char},
+    path::Path,
+    ptr,
+};
+
+use crate::{
+    config::{self, machine::MachineConfig, runtime::RuntimeConfig},
+    constants,
+    error::{MachineError, MachineResult as Result},
+    types::{
+        BreakReason, Hash, LogType, Register, SharingMode, UArchBreakReason,
+        access_proof::AccessLog,
+        cmio::{CmioRequest, CmioResponseReason},
+        collect::{McycleRootHashes, PartialBundle, UarchCycleRootHashes},
+        memory_proof::Proof,
+        memory_range::MemoryRangeDescriptions,
+    },
+};
+
+/// Machine instance handle.
+///
+/// Owns a `*mut cm_machine` and frees it on `Drop` via `cm_delete`. The raw
+/// pointer is kept private — exposing it would let callers clone it and cause
+/// a double-free when both `Machine`s get dropped.
+///
+/// `Machine` is intentionally `!Send + !Sync` (the default, given the raw
+/// pointer field). Do not add `unsafe impl Send for Machine` without auditing
+/// `cm_get_last_error_message`: the C library threads error messages through
+/// thread-local (or global) state with no machine-instance argument, so two
+/// `Machine`s running on different threads could scramble each other's
+/// `MachineError::message` fields.
+pub struct Machine {
+    machine: *mut cartesi_machine_sys::cm_machine,
+}
+
+impl Drop for Machine {
+    fn drop(&mut self) {
+        if !self.machine.is_null() {
+            unsafe {
+                cartesi_machine_sys::cm_delete(self.machine);
+            }
+        }
+    }
+}
+
+macro_rules! check_err {
+    ($err_code:expr) => {
+        if $err_code != constants::error_code::OK {
+            Err(Machine::last_error($err_code))
+        } else {
+            Ok(())
+        }
+    };
+}
+
+/// Both `serde_json::to_string` and `CString::new` below panic on failure
+/// *by design*. They can only fail on:
+/// - A Rust config type holding non-serializable state. Our types are plain
+///   POD with derived `Serialize`, so this is statically impossible.
+/// - A JSON string containing an interior NUL byte. `serde_json` escapes NUL
+///   as `\u0000`, so the output is guaranteed NUL-free.
+///
+/// If either panic ever fires, it indicates a bug in this crate or in
+/// `serde_json` — there is no recovery, and a panic with a backtrace is more
+/// debuggable than a bubbled-up `Result` that crashes at the caller anyway.
+macro_rules! serialize_to_json {
+    ($src:expr) => {
+        CString::new(serde_json::to_string($src).expect("failed serializing to json"))
+            .expect("CString::new failed")
+    };
+}
+
+/// Panics on malformed JSON from the C library. This means either a bug in
+/// `libcartesi` or a mismatch between the Rust struct shape and the
+/// emulator's JSON schema — the round-trip tests in `config/machine.rs` and
+/// `config/runtime.rs` are expected to catch the latter before production.
+/// A `Result` return here would force every call site to propagate an error
+/// variant for a condition with no meaningful recovery path; panicking gives
+/// a clearer stacktrace.
+macro_rules! parse_json_from_cstring {
+    ($src:expr) => {{
+        let cstr = unsafe { CStr::from_ptr($src) };
+        let json = cstr.to_string_lossy();
+        serde_json::from_str(&json).expect("could not parse json")
+    }};
+}
+
+impl Machine {
+    // -----------------------------------------------------------------------------
+    // API functions
+    // -----------------------------------------------------------------------------
+
+    /// Returns the emulator semantic version of the linked `libcartesi`, as
+    /// returned by `cm_get_version`. Encoded as
+    /// `(major * 1000000) + (minor * 1000) + patch`.
+    pub fn version() -> u64 {
+        unsafe { cartesi_machine_sys::cm_get_version() }
+    }
+
+    /// Returns the default machine config as parsed by serde.
+    pub fn default_config() -> Result<MachineConfig> {
+        let raw = Self::default_config_raw_json()?;
+        Ok(serde_json::from_str(&raw)
+            .expect("cm_get_default_config returned JSON that does not match MachineConfig"))
+    }
+
+    /// Returns the raw JSON string produced by `cm_get_default_config`,
+    /// without deserializing into a typed struct. Primarily used by the
+    /// round-trip schema test.
+    pub fn default_config_raw_json() -> Result<String> {
+        let mut config_ptr: *const c_char = ptr::null();
+        let err_code =
+            unsafe { cartesi_machine_sys::cm_get_default_config(ptr::null(), &mut config_ptr) };
+        check_err!(err_code)?;
+
+        let cstr = unsafe { CStr::from_ptr(config_ptr) };
+        Ok(cstr.to_string_lossy().into_owned())
+    }
+
+    /// Gets the address of any x, f, or control state register.
+    pub fn reg_address(reg: Register) -> Result<u64> {
+        let mut val: u64 = 0;
+        let err_code =
+            unsafe { cartesi_machine_sys::cm_get_reg_address(ptr::null(), reg, &mut val) };
+        check_err!(err_code)?;
+        Ok(val)
+    }
+
+    // -----------------------------------------------------------------------------
+    // Machine API functions
+    // -----------------------------------------------------------------------------
+
+    /// Creates a new machine instance from configuration.
+    pub fn create(config: &MachineConfig, runtime_config: &RuntimeConfig) -> Result<Self> {
+        let config_json = serialize_to_json!(&config);
+        let runtime_config_json = serialize_to_json!(&runtime_config);
+        let dir_cstr = CString::new("").unwrap(); // in-memory machine
+
+        let mut machine: *mut cartesi_machine_sys::cm_machine = ptr::null_mut();
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_create_new(
+                config_json.as_ptr(),
+                runtime_config_json.as_ptr(),
+                dir_cstr.as_ptr(),
+                &mut machine,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(Self { machine })
+    }
+
+    /// Loads a new machine instance from a previously stored directory with
+    /// every backing file mapped privately. Mutations stay in memory and are
+    /// discarded when the machine is destroyed.
+    pub fn load(dir: &Path, runtime_config: &RuntimeConfig) -> Result<Self> {
+        Self::load_with_sharing(dir, runtime_config, SharingMode::None)
+    }
+
+    /// Loads a stored machine with an explicit sharing mode.
+    ///
+    /// With [`SharingMode::All`] the machine mutates the directory in
+    /// place, and the directory remains a valid stored machine after
+    /// drop without any explicit flush: dirtiness is recorded in the
+    /// persisted dirty-page sidecars and the next `root_hash` rehashes
+    /// exactly the dirty set. Calling [`Machine::root_hash`] before
+    /// drop leaves the on-disk hash tree exact. Note the lifetime
+    /// exclusive lock: the directory cannot be cloned or re-loaded
+    /// shared until this machine is dropped.
+    pub fn load_with_sharing(
+        dir: &Path,
+        runtime_config: &RuntimeConfig,
+        sharing: SharingMode,
+    ) -> Result<Self> {
+        let dir_cstr = path_to_cstring(dir)?;
+        let runtime_config_json = serialize_to_json!(&runtime_config);
+
+        let mut machine: *mut cartesi_machine_sys::cm_machine = ptr::null_mut();
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_load_new(
+                dir_cstr.as_ptr(),
+                runtime_config_json.as_ptr(),
+                sharing.into(),
+                &mut machine,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(Self { machine })
+    }
+
+    /// Clones a stored machine directory without loading it: read-only
+    /// files hard-link, writable files reflink on CoW filesystems, and
+    /// either falls back to a sparse-aware copy where unsupported - so
+    /// the clone is cheap where the filesystem cooperates and correct
+    /// everywhere. Refuses an existing destination. Fails while the
+    /// source is loaded with [`SharingMode::All`] (the load holds the
+    /// lock); drop that machine first.
+    pub fn clone_stored(from_dir: &Path, to_dir: &Path) -> Result<()> {
+        let from_cstr = path_to_cstring(from_dir)?;
+        let to_cstr = path_to_cstring(to_dir)?;
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_clone_stored(ptr::null(), from_cstr.as_ptr(), to_cstr.as_ptr())
+        };
+        check_err!(err_code)?;
+
+        Ok(())
+    }
+
+    /// Renames a stored machine directory without replacing an existing
+    /// destination. The source must not be in use and both paths must be on
+    /// the same filesystem. On success, the rename and affected parent
+    /// directory entries are durable.
+    pub fn rename_stored(from_dir: &Path, to_dir: &Path) -> Result<()> {
+        let from_cstr = path_to_cstring(from_dir)?;
+        let to_cstr = path_to_cstring(to_dir)?;
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_rename_stored(ptr::null(), from_cstr.as_ptr(), to_cstr.as_ptr())
+        };
+        check_err!(err_code)?;
+
+        Ok(())
+    }
+
+    /// Flushes every file and directory entry of a stored machine to
+    /// permanent storage. The expected use is after closing the machine that
+    /// was using the stored files.
+    pub fn sync_stored(dir: &Path) -> Result<()> {
+        let dir_cstr = path_to_cstring(dir)?;
+        let err_code =
+            unsafe { cartesi_machine_sys::cm_sync_stored(ptr::null(), dir_cstr.as_ptr()) };
+        check_err!(err_code)?;
+
+        Ok(())
+    }
+
+    /// Removes a stored machine directory. The directory must not be in use;
+    /// on success, the removal of its parent directory entry is durable. On
+    /// failure, some files may remain.
+    pub fn remove_stored(dir: &Path) -> Result<()> {
+        let dir_cstr = path_to_cstring(dir)?;
+        let err_code =
+            unsafe { cartesi_machine_sys::cm_remove_stored(ptr::null(), dir_cstr.as_ptr()) };
+        check_err!(err_code)?;
+
+        Ok(())
+    }
+
+    /// Stores a machine instance to a directory, serializing its entire state.
+    /// Uses CM_SHARING_ALL so that the current machine state is written for all
+    /// address ranges (required when storing in-memory machines that have no
+    /// backing files).
+    pub fn store(&mut self, dir: &Path) -> Result<()> {
+        let dir_cstr = path_to_cstring(dir)?;
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_store(
+                self.machine,
+                dir_cstr.as_ptr(),
+                cartesi_machine_sys::CM_SHARING_ALL,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(())
+    }
+
+    /// Changes the machine runtime configuration.
+    pub fn set_runtime_config(&mut self, runtime_config: &RuntimeConfig) -> Result<()> {
+        let runtime_config_json = serialize_to_json!(&runtime_config);
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_set_runtime_config(self.machine, runtime_config_json.as_ptr())
+        };
+        check_err!(err_code)?;
+
+        Ok(())
+    }
+
+    /// Gets the machine runtime config as parsed by serde.
+    pub fn runtime_config(&mut self) -> Result<RuntimeConfig> {
+        let raw = self.runtime_config_raw_json()?;
+        Ok(serde_json::from_str(&raw)
+            .expect("cm_get_runtime_config returned JSON that does not match RuntimeConfig"))
+    }
+
+    /// Returns the raw JSON string produced by `cm_get_runtime_config`. Used
+    /// by the round-trip schema test.
+    pub fn runtime_config_raw_json(&mut self) -> Result<String> {
+        let mut rc_ptr: *const c_char = ptr::null();
+        let err_code =
+            unsafe { cartesi_machine_sys::cm_get_runtime_config(self.machine, &mut rc_ptr) };
+        check_err!(err_code)?;
+
+        let cstr = unsafe { CStr::from_ptr(rc_ptr) };
+        Ok(cstr.to_string_lossy().into_owned())
+    }
+
+    /// Replaces a memory range.
+    ///
+    /// Two intentional simplifications vs. the full JSON schema the C API
+    /// accepts:
+    ///
+    /// - `read_only` is hardcoded to `false`. The C++
+    ///   `machine_address_ranges::replace` explicitly rejects both a
+    ///   read-only existing range and a replacement config with
+    ///   `read_only: true` (see `machine-address-ranges.cpp`), so exposing a
+    ///   `read_only` toggle here would always error. If that ever changes,
+    ///   widen this API then.
+    /// - When `image_path` is `None`, `data_filename` is serialized as the
+    ///   empty string. The C++ side treats empty `data_filename` as "no
+    ///   backing store" (`backing_store_config::newly_created()` returns
+    ///   true when `create || data_filename.empty()`), which is the same
+    ///   semantics as the old API's `NULL` pointer: the range is
+    ///   zero-filled in-memory.
+    pub fn replace_memory_range(
+        &mut self,
+        start: u64,
+        length: u64,
+        shared: bool,
+        image_path: Option<&Path>,
+    ) -> Result<()> {
+        let range_config = serde_json::json!({
+            "start": start,
+            "length": length,
+            "read_only": false,
+            "backing_store": {
+                "data_filename": image_path.map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                "shared": shared
+            }
+        });
+
+        let range_json = serialize_to_json!(&range_config);
+
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_replace_memory_range(self.machine, range_json.as_ptr())
+        };
+        check_err!(err_code)?;
+
+        Ok(())
+    }
+
+    /// Returns the machine config used to initialize the machine.
+    pub fn initial_config(&mut self) -> Result<config::machine::MachineConfig> {
+        let mut config_ptr: *const c_char = ptr::null();
+        let err_code =
+            unsafe { cartesi_machine_sys::cm_get_initial_config(self.machine, &mut config_ptr) };
+        check_err!(err_code)?;
+
+        let config = parse_json_from_cstring!(config_ptr);
+
+        Ok(config)
+    }
+
+    /// Returns a list with all memory ranges in the machine.
+    pub fn memory_ranges(&mut self) -> Result<MemoryRangeDescriptions> {
+        let mut ranges_ptr: *const c_char = ptr::null();
+        let err_code =
+            unsafe { cartesi_machine_sys::cm_get_address_ranges(self.machine, &mut ranges_ptr) };
+        check_err!(err_code)?;
+
+        let ranges = parse_json_from_cstring!(ranges_ptr);
+
+        Ok(ranges)
+    }
+
+    /// Obtains the root hash of the Merkle tree.
+    pub fn root_hash(&mut self) -> Result<Hash> {
+        let mut hash = Hash::default();
+        let err_code = unsafe { cartesi_machine_sys::cm_get_root_hash(self.machine, &mut hash) };
+        check_err!(err_code)?;
+
+        Ok(hash)
+    }
+
+    /// Obtains the proof for a node in the machine state Merkle tree.
+    pub fn proof(
+        &mut self,
+        address: u64,
+        log2_target_size: u32,
+        log2_root_size: u32,
+    ) -> Result<Proof> {
+        let mut proof_ptr: *const c_char = ptr::null();
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_get_proof(
+                self.machine,
+                address,
+                log2_target_size as ::std::os::raw::c_int,
+                log2_root_size as ::std::os::raw::c_int,
+                &mut proof_ptr,
+            )
+        };
+        check_err!(err_code)?;
+
+        let proof = parse_json_from_cstring!(proof_ptr);
+
+        Ok(proof)
+    }
+
+    // ------------------------------------
+    // Reading and writing
+    // ------------------------------------
+
+    /// Reads the value of a word in the machine state, by its physical address.
+    pub fn read_word(&mut self, address: u64) -> Result<u64> {
+        let mut value: u64 = 0;
+        let err_code =
+            unsafe { cartesi_machine_sys::cm_read_word(self.machine, address, &mut value) };
+        check_err!(err_code)?;
+
+        Ok(value)
+    }
+
+    /// Reads the value of a register.
+    pub fn read_reg(&mut self, reg: Register) -> Result<u64> {
+        let mut value: u64 = 0;
+        let err_code = unsafe { cartesi_machine_sys::cm_read_reg(self.machine, reg, &mut value) };
+        check_err!(err_code)?;
+
+        Ok(value)
+    }
+
+    /// Writes the value of a register.
+    pub fn write_reg(&mut self, reg: Register, val: u64) -> Result<()> {
+        let err_code = unsafe { cartesi_machine_sys::cm_write_reg(self.machine, reg, val) };
+        check_err!(err_code)?;
+
+        Ok(())
+    }
+
+    /// Reads a chunk of data from a machine memory range, by its physical address.
+    pub fn read_memory(&mut self, address: u64, size: u64) -> Result<Vec<u8>> {
+        let mut buffer = vec![0u8; u64_to_usize(size)?];
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_read_memory(self.machine, address, buffer.as_mut_ptr(), size)
+        };
+        check_err!(err_code)?;
+
+        Ok(buffer)
+    }
+
+    /// Writes a chunk of data to a machine memory range, by its physical address.
+    pub fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_write_memory(
+                self.machine,
+                address,
+                data.as_ptr(),
+                data.len() as u64,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(())
+    }
+
+    /// Reads a chunk of data from a machine memory range, by its virtual memory.
+    pub fn read_virtual_memory(&mut self, address: u64, size: u64) -> Result<Vec<u8>> {
+        let mut buffer = vec![0u8; u64_to_usize(size)?];
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_read_virtual_memory(
+                self.machine,
+                address,
+                buffer.as_mut_ptr(),
+                size,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(buffer)
+    }
+
+    /// Writes a chunk of data to a machine memory range, by its virtual address.
+    pub fn write_virtual_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_write_virtual_memory(
+                self.machine,
+                address,
+                data.as_ptr(),
+                data.len() as u64,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(())
+    }
+
+    /// Translates a virtual memory address to its corresponding physical memory address.
+    pub fn translate_virtual_address(&mut self, virtual_address: u64) -> Result<u64> {
+        let mut paddr: u64 = 0;
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_translate_virtual_address(
+                self.machine,
+                virtual_address,
+                &mut paddr,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(paddr)
+    }
+
+    // ------------------------------------
+    // Running
+    // ------------------------------------
+
+    /// Returns machine CM_REG_MCYCLE
+    pub fn mcycle(&mut self) -> Result<u64> {
+        self.read_reg(cartesi_machine_sys::CM_REG_MCYCLE)
+    }
+
+    /// Returns the maximum mcycle for the current advance-state input.
+    pub fn imcyclemax(&mut self) -> Result<u64> {
+        self.read_reg(cartesi_machine_sys::CM_REG_IMCYCLEMAX)
+    }
+
+    /// Returns machine CM_REG_IFLAGS_Y
+    pub fn iflags_y(&mut self) -> Result<bool> {
+        Ok(self.read_reg(cartesi_machine_sys::CM_REG_IFLAGS_Y)? != 0)
+    }
+
+    /// Returns machine CM_REG_IFLAGS_H
+    pub fn iflags_h(&mut self) -> Result<bool> {
+        Ok(self.read_reg(cartesi_machine_sys::CM_REG_IFLAGS_H)? != 0)
+    }
+
+    /// Returns machine CM_REG_UARCH_CYCLE
+    pub fn ucycle(&mut self) -> Result<u64> {
+        self.read_reg(cartesi_machine_sys::CM_REG_UARCH_CYCLE)
+    }
+
+    /// Returns machine CM_REG_UARCH_HALT.
+    pub fn uarch_halt_flag(&mut self) -> Result<bool> {
+        Ok(self.read_reg(cartesi_machine_sys::CM_REG_UARCH_HALT)? != 0)
+    }
+
+    /// Runs the machine until CM_REG_MCYCLE reaches mcycle_end, machine yields, or halts.
+    pub fn run(&mut self, mcycle_end: u64) -> Result<BreakReason> {
+        let mut break_reason = BreakReason::default();
+        let cm_error =
+            unsafe { cartesi_machine_sys::cm_run(self.machine, mcycle_end, &mut break_reason) };
+        check_err!(cm_error)?;
+
+        Ok(break_reason)
+    }
+
+    /// Runs the machine microarchitecture until CM_REG_UARCH_CYCLE reaches uarch_cycle_end or it halts.
+    pub fn run_uarch(&mut self, uarch_cycle_end: u64) -> Result<UArchBreakReason> {
+        let mut break_reason = UArchBreakReason::default();
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_run_uarch(self.machine, uarch_cycle_end, &mut break_reason)
+        };
+        check_err!(err_code)?;
+
+        Ok(break_reason)
+    }
+
+    /// Resets the entire microarchitecture state to pristine values.
+    pub fn reset_uarch(&mut self) -> Result<()> {
+        let err_code = unsafe { cartesi_machine_sys::cm_reset_uarch(self.machine) };
+        check_err!(err_code)?;
+
+        Ok(())
+    }
+
+    /// Collects state root hashes every 2^`log2_mcycle_period` mcycles until
+    /// `mcycle_end` or a fixed point (`cm_collect_mcycle_root_hashes`, whose
+    /// documentation is the contract). `mcycle_phase` and
+    /// `previous_partial_bundle` continue a previous call's sampling and
+    /// bundling; a call also stops at automatic yields, so callers loop.
+    pub fn collect_mcycle_root_hashes(
+        &mut self,
+        mcycle_end: u64,
+        log2_mcycle_period: u64,
+        mcycle_phase: u64,
+        log2_bundle_mcycle_count: u32,
+        previous_partial_bundle: Option<&PartialBundle>,
+    ) -> Result<McycleRootHashes> {
+        let bundle = previous_partial_bundle
+            .map(|bundle| CString::new(bundle.as_json()).expect("serde_json escapes NUL"));
+        let mut result_ptr: *const c_char = ptr::null();
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_collect_mcycle_root_hashes(
+                self.machine,
+                mcycle_end,
+                log2_mcycle_period,
+                mcycle_phase,
+                bundle_log2(log2_bundle_mcycle_count, 63)?,
+                bundle
+                    .as_ref()
+                    .map_or(ptr::null(), |bundle| bundle.as_ptr()),
+                &mut result_ptr,
+            )
+        };
+        check_err!(err_code)?;
+
+        // Parsed before any other API call can reuse the result buffer.
+        let json = unsafe { CStr::from_ptr(result_ptr) }.to_string_lossy();
+        Ok(McycleRootHashes::from_json(&json).expect("malformed mcycle collection result"))
+    }
+
+    /// Collects state root hashes after every uarch cycle until `mcycle_end`
+    /// or a fixed point, resetting the uarch between mcycles
+    /// (`cm_collect_uarch_cycle_root_hashes`, whose documentation is the
+    /// contract). The uarch must sit at cycle zero. `revert_uarch_tail` is the
+    /// unbundled period collected on the machine whose root is the recorded
+    /// revert root; the emulator requires it whenever the call may execute,
+    /// and refuses the call before executing anything when it is missing.
+    pub fn collect_uarch_cycle_root_hashes(
+        &mut self,
+        mcycle_end: u64,
+        log2_bundle_uarch_cycle_count: u32,
+        revert_uarch_tail: Option<&[Hash]>,
+    ) -> Result<UarchCycleRootHashes> {
+        let tail = revert_uarch_tail.map(|tail| {
+            let encoded: Vec<String> = tail
+                .iter()
+                .map(|hash| base64::Engine::encode(&base64::prelude::BASE64_STANDARD, hash))
+                .collect();
+            serialize_to_json!(&encoded)
+        });
+        let mut result_ptr: *const c_char = ptr::null();
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_collect_uarch_cycle_root_hashes(
+                self.machine,
+                mcycle_end,
+                bundle_log2(
+                    log2_bundle_uarch_cycle_count,
+                    constants::rollup::LOG2_MAX_UARCH_CYCLES_PER_MCYCLE as u32,
+                )?,
+                tail.as_ref().map_or(ptr::null(), |tail| tail.as_ptr()),
+                &mut result_ptr,
+            )
+        };
+        check_err!(err_code)?;
+
+        // Parsed before any other API call can reuse the result buffer.
+        let json = unsafe { CStr::from_ptr(result_ptr) }.to_string_lossy();
+        Ok(UarchCycleRootHashes::from_json(&json).expect("malformed uarch collection result"))
+    }
+
+    /// Receives a cmio request.
+    pub fn receive_cmio_request(&mut self) -> Result<CmioRequest> {
+        let mut cmd: u8 = 0;
+        let mut reason: u16 = 0;
+        let mut length: u64 = 0;
+
+        // First call with a NULL data pointer: the C API just writes the
+        // required length into `length` and returns, without reading any
+        // bytes. (See cm.h: "If NULL, length will still be set
+        // without reading any data.")
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_receive_cmio_request(
+                self.machine,
+                &mut cmd,
+                &mut reason,
+                ptr::null_mut(),
+                &mut length,
+            )
+        };
+        check_err!(err_code)?;
+
+        // `length` is in-out per the C API contract ("Must be initialized to
+        // the size of data buffer"). Sizing the buffer to exactly `length`
+        // and then passing the same value back in makes the buffer-size
+        // precondition and the required-length output coincide.
+        let mut buffer = vec![0u8; u64_to_usize(length)?];
+
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_receive_cmio_request(
+                self.machine,
+                &mut cmd,
+                &mut reason,
+                buffer.as_mut_ptr(),
+                &mut length,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(CmioRequest::new(cmd, reason, buffer))
+    }
+
+    /// Sends a cmio response.
+    pub fn send_cmio_response(
+        &mut self,
+        reason: CmioResponseReason,
+        data: &[u8],
+        revert_root_hash: Option<&Hash>,
+    ) -> Result<()> {
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_send_cmio_response(
+                self.machine,
+                reason.into(),
+                data.as_ptr(),
+                data.len() as u64,
+                optional_hash_ptr(revert_root_hash),
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(())
+    }
+
+    // ------------------------------------
+    // Logging
+    // ------------------------------------
+
+    /// Runs the machine for the given mcycle count and generates a log of accessed pages and proof data.
+    pub fn log_step(&mut self, mcycle_count: u64, log_filename: &Path) -> Result<BreakReason> {
+        let mut break_reason = BreakReason::default();
+        let log_filename_c = path_to_cstring(log_filename)?;
+
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_log_step(
+                self.machine,
+                mcycle_count,
+                log_filename_c.as_ptr(),
+                &mut break_reason,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(break_reason)
+    }
+
+    /// Runs the machine in the microarchitecture for one micro cycle logging all accesses to the state.
+    pub fn log_step_uarch(&mut self, log_type: LogType) -> Result<AccessLog> {
+        let mut log_ptr: *const c_char = ptr::null();
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_log_step_uarch(
+                self.machine,
+                log_type.to_bitflag(),
+                &mut log_ptr,
+            )
+        };
+        check_err!(err_code)?;
+
+        let access_log = parse_json_from_cstring!(log_ptr);
+
+        Ok(access_log)
+    }
+
+    /// Resets the entire microarchitecture state to pristine values logging all accesses to the state.
+    pub fn log_reset_uarch(&mut self, log_type: LogType) -> Result<AccessLog> {
+        let mut log_ptr: *const c_char = ptr::null();
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_log_reset_uarch(
+                self.machine,
+                log_type.to_bitflag(),
+                &mut log_ptr,
+            )
+        };
+        check_err!(err_code)?;
+
+        let access_log = parse_json_from_cstring!(log_ptr);
+
+        Ok(access_log)
+    }
+
+    /// Sends a cmio response logging all accesses to the state.
+    pub fn log_send_cmio_response(
+        &mut self,
+        reason: CmioResponseReason,
+        data: &[u8],
+        revert_root_hash: &Hash,
+        log_type: LogType,
+    ) -> Result<AccessLog> {
+        let mut log_ptr: *const c_char = ptr::null();
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_log_send_cmio_response(
+                self.machine,
+                reason.into(),
+                data.as_ptr(),
+                data.len() as u64,
+                revert_root_hash,
+                log_type.to_bitflag(),
+                &mut log_ptr,
+            )
+        };
+        check_err!(err_code)?;
+
+        let access_log = parse_json_from_cstring!(log_ptr);
+
+        Ok(access_log)
+    }
+
+    // ------------------------------------
+    // Verifying
+    // ------------------------------------
+
+    /// Checks the validity of a step log file.
+    pub fn verify_step(
+        root_hash_before: &Hash,
+        log_filename: &Path,
+        mcycle_count: u64,
+    ) -> Result<Hash> {
+        let log_filename_c = path_to_cstring(log_filename)?;
+
+        let mut obtained_root_hash = Hash::default();
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_verify_step(
+                root_hash_before,
+                log_filename_c.as_ptr(),
+                mcycle_count,
+                &mut obtained_root_hash,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(obtained_root_hash)
+    }
+
+    /// Checks the validity of a state transition produced by cm_log_step_uarch.
+    pub fn verify_step_uarch(root_hash_before: &Hash, log: &AccessLog) -> Result<Hash> {
+        let log_cstr = serialize_to_json!(&log);
+        let mut obtained_root_hash = Hash::default();
+
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_verify_step_uarch(
+                // Optional `const cm_machine *m`; NULL means "local verification".
+                // See cm.h. (cm_verify_step itself doesn't take this
+                // argument — the asymmetry is intentional in the C API.)
+                ptr::null(),
+                root_hash_before,
+                log_cstr.as_ptr(),
+                &mut obtained_root_hash,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(obtained_root_hash)
+    }
+
+    /// Checks the validity of a state transition produced by cm_log_verify_reset_uarch.
+    pub fn verify_reset_uarch(root_hash_before: &Hash, log: &AccessLog) -> Result<Hash> {
+        let log_cstr = serialize_to_json!(&log);
+        let mut obtained_root_hash = Hash::default();
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_verify_reset_uarch(
+                // Optional `const cm_machine *m`; NULL means "local verification".
+                // See cm.h.
+                ptr::null(),
+                root_hash_before,
+                log_cstr.as_ptr(),
+                &mut obtained_root_hash,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(obtained_root_hash)
+    }
+
+    /// Checks the validity of a state transition produced by cm_log_send_cmio_response.
+    pub fn verify_send_cmio_response(
+        reason: CmioResponseReason,
+        data: &[u8],
+        root_hash_before: &Hash,
+        log: &AccessLog,
+        revert_root_hash: &Hash,
+    ) -> Result<Hash> {
+        let log_cstr = serialize_to_json!(&log);
+        let mut obtained_root_hash = Hash::default();
+
+        let err_code = unsafe {
+            cartesi_machine_sys::cm_verify_send_cmio_response(
+                // Optional `const cm_machine *m`; NULL means "local verification".
+                // See cm.h.
+                ptr::null(),
+                reason.into(),
+                data.as_ptr(),
+                data.len() as u64,
+                root_hash_before,
+                log_cstr.as_ptr(),
+                revert_root_hash,
+                &mut obtained_root_hash,
+            )
+        };
+        check_err!(err_code)?;
+
+        Ok(obtained_root_hash)
+    }
+}
+
+fn optional_hash_ptr(hash: Option<&Hash>) -> *const Hash {
+    hash.map_or(ptr::null(), |hash| hash as *const Hash)
+}
+
+/// The C API takes bundle sizes as int32_t, and v0.21.0 computes with them
+/// before validating (a uarch bundle above 2^20 makes a negative shift, which
+/// is undefined behavior), so sizes past `max` are refused before the call.
+fn bundle_log2(log2: u32, max: u32) -> Result<i32> {
+    if log2 > max {
+        return Err(MachineError {
+            code: constants::error_code::INVALID_ARGUMENT,
+            message: format!("log2 bundle count {log2} exceeds {max}"),
+        });
+    }
+    Ok(log2 as i32)
+}
+
+impl Machine {
+    fn last_error(code: i32) -> MachineError {
+        assert!(code != constants::error_code::OK);
+
+        let msg_p = unsafe { cartesi_machine_sys::cm_get_last_error_message() };
+        let cstr = unsafe { std::ffi::CStr::from_ptr(msg_p) };
+        let message = String::from_utf8_lossy(cstr.to_bytes()).to_string();
+
+        MachineError { code, message }
+    }
+}
+
+/// Converts a `u64` byte count (as used by the C API) to a Rust `usize`,
+/// erroring out if the value exceeds what the platform can address. Only
+/// matters on 32-bit targets — on 64-bit, `usize` and `u64` are the same
+/// width and this is a no-op. Guards against silent truncation that would
+/// result in an undersized buffer being passed to a C function expecting
+/// `size` bytes of space.
+fn u64_to_usize(size: u64) -> Result<usize> {
+    usize::try_from(size).map_err(|_| MachineError {
+        code: constants::error_code::OUT_OF_RANGE,
+        message: format!("byte count {size} exceeds usize range on this platform"),
+    })
+}
+
+/// Converts a `Path` to a `CString` for the C API.
+///
+/// On Unix, uses the raw `OsStr` bytes so that non-UTF-8 paths (which are
+/// legal on the platform) are passed through verbatim instead of being
+/// silently corrupted by `to_string_lossy` replacement. On other platforms,
+/// falls back to UTF-8 conversion and errors out if the path is not valid
+/// UTF-8.
+///
+/// Returns `CM_ERROR_INVALID_ARGUMENT` on an interior NUL byte or, on
+/// non-Unix, on a non-UTF-8 path.
+fn path_to_cstring(path: &Path) -> Result<CString> {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = path
+        .to_str()
+        .ok_or_else(|| MachineError {
+            code: constants::error_code::INVALID_ARGUMENT,
+            message: format!("path is not valid UTF-8: {}", path.display()),
+        })?
+        .as_bytes()
+        .to_vec();
+
+    CString::new(bytes).map_err(|e| MachineError {
+        code: constants::error_code::INVALID_ARGUMENT,
+        message: format!("path contains NUL byte ({}): {}", e, path.display()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::{
+        config::{
+            machine::{BackingStoreConfig, MachineConfig, MemoryRangeConfig, RAMConfig},
+            runtime::RuntimeConfig,
+        },
+        constants,
+        error::MachineResult as Result,
+        types::cmio::ManualReason,
+    };
+
+    /// Path of a test image prepared by `scripts/prepare-test-images.sh`, in
+    /// `CARTESI_MACHINE_TEST_IMAGES` or the workspace's `test-images`.
+    fn test_image(name: &str) -> String {
+        let dir = std::env::var("CARTESI_MACHINE_TEST_IMAGES").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-images").to_string()
+        });
+        let path = format!("{dir}/{name}");
+        assert!(
+            Path::new(&path).exists(),
+            "test image `{path}` not found; run scripts/prepare-test-images.sh"
+        );
+        path
+    }
+
+    fn make_basic_machine_config() -> MachineConfig {
+        let mut config = Machine::default_config().expect("failed to get default config");
+        config.ram = RAMConfig {
+            length: 134217728,
+            backing_store: BackingStoreConfig {
+                data_filename: test_image("linux.bin").into(),
+                ..Default::default()
+            },
+        };
+        config.dtb.entrypoint = "echo Hello from inside!".to_string();
+        config.flash_drive = vec![MemoryRangeConfig {
+            backing_store: BackingStoreConfig {
+                data_filename: test_image("rootfs.ext2").into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        config
+    }
+
+    fn make_cmio_machine_config() -> MachineConfig {
+        let mut config = Machine::default_config().expect("failed to get default config");
+        config.ram = RAMConfig {
+            length: 134217728,
+            backing_store: BackingStoreConfig {
+                data_filename: test_image("linux.bin").into(),
+                ..Default::default()
+            },
+        };
+        config.dtb.entrypoint =
+            "echo '{\"domain\":16,\"id\":\"'$(echo -n Hello from inside! | hex --encode)'\"}' \
+                     | rollup gio | grep -Eo '0x[0-9a-f]+' | tr -d '\\n' | hex --decode; echo"
+                .to_string();
+        config.flash_drive = vec![MemoryRangeConfig {
+            backing_store: BackingStoreConfig {
+                data_filename: test_image("rootfs.ext2").into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        config
+    }
+
+    fn create_machine(config: &MachineConfig) -> Result<Machine> {
+        Machine::create(config, &RuntimeConfig::quiet_console())
+    }
+
+    #[test]
+    fn test_machine_run_halt_root_hash() -> Result<()> {
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+
+        let break_reason = machine.run(u64::MAX)?;
+        assert_eq!(break_reason, constants::break_reason::HALTED);
+
+        let mcycle_after_halt = machine.mcycle()?;
+        let root_hash_before = machine.root_hash()?;
+
+        let break_reason = machine.run(u64::MAX)?;
+        assert_eq!(break_reason, constants::break_reason::HALTED);
+
+        let root_hash_after = machine.root_hash()?;
+        assert_eq!(root_hash_before, root_hash_after,);
+
+        let mcycle_after_second_run = machine.mcycle()?;
+        assert_eq!(mcycle_after_halt, mcycle_after_second_run,);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_machine_uarch_reset() -> Result<()> {
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+
+        machine.run(1)?;
+        let reference_hash = machine.root_hash()?;
+        let initial_config = machine.initial_config()?;
+        drop(machine);
+
+        let mut machine = create_machine(&initial_config)?;
+
+        let uarch_break_reason = machine.run_uarch(u64::MAX)?;
+        assert_eq!(
+            uarch_break_reason,
+            constants::uarch_break_reason::UARCH_HALTED
+        );
+
+        machine.reset_uarch()?;
+
+        let final_hash = machine.root_hash()?;
+        assert_eq!(reference_hash, final_hash,);
+
+        let ucycle = machine.ucycle()?;
+        assert_eq!(ucycle, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_runtime_config_round_trip() -> Result<()> {
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+
+        let original_config = machine.runtime_config()?;
+        machine.set_runtime_config(&original_config)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_log_step() -> Result<()> {
+        let tmp_dir = tempfile::tempdir().expect("failed creating a temp dir");
+        let log_path = tmp_dir.path().join("machine_step.log");
+
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+
+        let root_hash_before = machine.root_hash()?;
+
+        machine.log_step(50, &log_path)?;
+        let root_hash_after = machine.root_hash()?;
+
+        let verified_root_hash = Machine::verify_step(&root_hash_before, &log_path, 50)?;
+        assert_eq!(verified_root_hash, root_hash_after);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_log_step_uarch() -> Result<()> {
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+
+        let root_hash_before = machine.root_hash()?;
+        let access_log: AccessLog = machine.log_step_uarch(LogType::default().with_large_data())?;
+        let root_hash_after = machine.root_hash()?;
+
+        let verified_root_hash = Machine::verify_step_uarch(&root_hash_before, &access_log)?;
+        assert_eq!(verified_root_hash, root_hash_after);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_log_reset_uarch() -> Result<()> {
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+
+        let root_hash_before = machine.root_hash()?;
+        let reset_log = machine.log_reset_uarch(LogType::default().with_annotations())?;
+        let root_hash_after = machine.root_hash()?;
+
+        let verified_root_hash = Machine::verify_reset_uarch(&root_hash_before, &reset_log)?;
+        assert_eq!(verified_root_hash, root_hash_after);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_log_send_cmio_response() -> Result<()> {
+        let config = make_cmio_machine_config();
+        let mut machine = create_machine(&config)?;
+
+        let break_reason = machine.run(u64::MAX)?;
+        assert_eq!(break_reason, constants::break_reason::YIELDED_MANUALLY);
+
+        let root_hash_before = machine.root_hash()?;
+
+        let request = machine.receive_cmio_request()?;
+        assert!(matches!(
+            request,
+            CmioRequest::Manual(ManualReason::GIO { domain: 16, ref data })
+            if data == b"Hello from inside!"
+        ));
+        let response_data = b"Hello from outside!";
+        let access_log: AccessLog = machine.log_send_cmio_response(
+            CmioResponseReason::Gio(16),
+            response_data,
+            &root_hash_before,
+            LogType::default().with_large_data(),
+        )?;
+
+        let root_hash_after = machine.root_hash()?;
+
+        let verified_root_hash = Machine::verify_send_cmio_response(
+            CmioResponseReason::Gio(16),
+            response_data,
+            &root_hash_before,
+            &access_log,
+            &root_hash_before,
+        )?;
+        assert_eq!(verified_root_hash, root_hash_after);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_machine_cmio() -> Result<()> {
+        let cmio_config = make_cmio_machine_config();
+        let mut machine = create_machine(&cmio_config)?;
+
+        let break_reason = machine.run(u64::MAX)?;
+        assert_eq!(break_reason, constants::break_reason::YIELDED_MANUALLY);
+
+        let request = machine.receive_cmio_request()?;
+        assert!(matches!(
+            request,
+            CmioRequest::Manual(ManualReason::GIO { domain: 16, ref data })
+            if data == b"Hello from inside!"
+        ));
+
+        let response = b"Hello from outside!";
+        machine.send_cmio_response(CmioResponseReason::Gio(16), response, None)?;
+
+        let break_reason = machine.run(u64::MAX)?;
+        assert_eq!(break_reason, constants::break_reason::HALTED);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_store_and_load_machine() -> Result<()> {
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+
+        let break_reason = machine.run(1000)?;
+        assert_eq!(break_reason, constants::break_reason::REACHED_TARGET_MCYCLE);
+        let root_hash_before_store = machine.root_hash()?;
+
+        let tmp_dir = tempfile::tempdir().expect("failed creating a temp dir");
+        let store_path = tmp_dir.path().join("image");
+        machine.store(&store_path)?;
+
+        let runtime_config = RuntimeConfig::default();
+        let mut machine = Machine::load(&store_path, &runtime_config)?;
+
+        let root_hash_after_load = machine.root_hash()?;
+        assert_eq!(root_hash_before_store, root_hash_after_load,);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_keeps_stored_machine_private() -> Result<()> {
+        const STORED_MCYCLE: u64 = 1_000;
+        const PRIVATE_MCYCLE: u64 = 2_000;
+
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+        assert_eq!(
+            machine.run(STORED_MCYCLE)?,
+            constants::break_reason::REACHED_TARGET_MCYCLE
+        );
+        let stored_root = machine.root_hash()?;
+
+        let tmp = tempfile::tempdir().expect("failed creating a temp dir");
+        let stored = tmp.path().join("stored");
+        machine.store(&stored)?;
+        drop(machine);
+
+        {
+            let mut private = Machine::load(&stored, &RuntimeConfig::quiet_console())?;
+            assert_eq!(
+                private.run(PRIVATE_MCYCLE)?,
+                constants::break_reason::REACHED_TARGET_MCYCLE
+            );
+            assert_ne!(private.root_hash()?, stored_root);
+        }
+
+        let mut reloaded = Machine::load(&stored, &RuntimeConfig::quiet_console())?;
+        assert_eq!(reloaded.mcycle()?, STORED_MCYCLE);
+        assert_eq!(reloaded.root_hash()?, stored_root);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_memory_range() -> Result<()> {
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+
+        let ranges_before = machine.memory_ranges()?;
+        assert!(!ranges_before.is_empty());
+
+        let range = ranges_before.last().unwrap();
+
+        let mem = machine.read_memory(range.start, range.length)?;
+        assert!(mem.iter().any(|x| *x != 0));
+
+        // writes zeroes in range
+        machine.replace_memory_range(range.start, range.length, false, None)?;
+        let mem = machine.read_memory(range.start, range.length)?;
+        assert!(!mem.iter().any(|x| *x != 0));
+
+        // write ones in range
+        machine.write_memory(range.start, &vec![1; range.length as usize])?;
+        let mem = machine.read_memory(range.start, range.length)?;
+        assert!(mem.iter().all(|x| *x == 1));
+
+        let log2_size = u64::BITS - range.length.leading_zeros();
+        let proof: Proof = machine.proof(
+            range.start,
+            u64::BITS - range.length.leading_zeros(),
+            constants::machine::HASH_TREE_LOG2_ROOT_SIZE,
+        )?;
+        assert_eq!(proof.target_address, range.start);
+        assert_eq!(proof.log2_target_size, log2_size as u64);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_memory_ops() -> Result<()> {
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+
+        let reg = cartesi_machine_sys::CM_REG_X1;
+        let reg_phys_addr = Machine::reg_address(reg)?;
+
+        let val_via_read_word = machine.read_word(reg_phys_addr)?;
+        let val_via_read_reg = machine.read_reg(reg)?;
+        assert_eq!(val_via_read_word, val_via_read_reg);
+
+        let new_reg_value = 0x1234_5678_9ABC_DEF0;
+        machine.write_reg(reg, new_reg_value)?;
+        let val_via_read_word2 = machine.read_word(reg_phys_addr)?;
+        assert_eq!(val_via_read_word2, new_reg_value);
+
+        let val_via_read_reg2 = machine.read_reg(reg)?;
+        assert_eq!(val_via_read_reg2, new_reg_value);
+
+        Ok(())
+    }
+
+    /// A clone loaded with SharingMode::All advances on disk and remains
+    /// a valid stored machine after drop, with the hash sidecars exact
+    /// when root_hash ran before the drop, and self-healing from the
+    /// recorded dirty pages when it did not (the crash shape). Both
+    /// clones must reload to the root hash of an in-memory advance of
+    /// the same cycles, and the clone source must not move.
+    #[test]
+    fn test_clone_stored_round_trip_sharing_all() -> Result<()> {
+        const PREFIX: u64 = 5_000_000;
+        const TARGET: u64 = 15_000_000;
+        let tmp = tempfile::tempdir().expect("failed creating a temp dir");
+        let stored = tmp.path().join("stored");
+        let hashed = tmp.path().join("hashed");
+        let crashed = tmp.path().join("crashed");
+
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+        assert_eq!(
+            machine.run(PREFIX)?,
+            constants::break_reason::REACHED_TARGET_MCYCLE
+        );
+        machine.store(&stored)?;
+        assert_eq!(
+            machine.run(TARGET)?,
+            constants::break_reason::REACHED_TARGET_MCYCLE
+        );
+        let expected = machine.root_hash()?;
+        drop(machine);
+
+        // Advance one clone on disk with the sidecars brought exact
+        // before the drop.
+        Machine::clone_stored(&stored, &hashed)?;
+        {
+            let mut on_disk = Machine::load_with_sharing(
+                &hashed,
+                &RuntimeConfig::quiet_console(),
+                SharingMode::All,
+            )?;
+            on_disk.run(TARGET)?;
+            on_disk.root_hash()?;
+        }
+
+        // Advance another and drop it cold: no root_hash, stale hash
+        // sidecars, dirtiness recorded. The crash shape.
+        Machine::clone_stored(&stored, &crashed)?;
+        {
+            let mut on_disk = Machine::load_with_sharing(
+                &crashed,
+                &RuntimeConfig::quiet_console(),
+                SharingMode::All,
+            )?;
+            on_disk.run(TARGET)?;
+        }
+
+        for dir in [&hashed, &crashed] {
+            let mut reloaded = Machine::load(dir, &RuntimeConfig::quiet_console())?;
+            assert_eq!(reloaded.mcycle()?, TARGET);
+            assert_eq!(reloaded.root_hash()?, expected);
+        }
+
+        // Clone isolation: writes to the clones never reach the source.
+        let mut source = Machine::load(&stored, &RuntimeConfig::quiet_console())?;
+        assert_eq!(source.mcycle()?, PREFIX);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_and_rename_stored_without_overwrite() -> Result<()> {
+        let tmp = tempfile::tempdir().expect("failed creating a temp dir");
+        let stored = tmp.path().join("stored");
+        let renamed = tmp.path().join("renamed");
+        let contender = tmp.path().join("contender");
+        let occupied = tmp.path().join("occupied");
+
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+        machine.run(1_000)?;
+        let expected_root = machine.root_hash()?;
+        machine.store(&stored)?;
+        drop(machine);
+
+        Machine::sync_stored(&stored)?;
+        Machine::rename_stored(&stored, &renamed)?;
+        assert!(!stored.exists());
+        assert!(renamed.exists());
+
+        {
+            let mut reloaded = Machine::load(&renamed, &RuntimeConfig::quiet_console())?;
+            assert_eq!(reloaded.root_hash()?, expected_root);
+        }
+
+        Machine::clone_stored(&renamed, &contender)?;
+        Machine::clone_stored(&renamed, &occupied)?;
+        let error = Machine::rename_stored(&contender, &occupied)
+            .expect_err("rename must not replace an existing destination");
+        assert_eq!(error.code, constants::error_code::RUNTIME_ERROR);
+        assert!(error.message.contains("destination exists"));
+
+        for dir in [&contender, &occupied] {
+            assert!(dir.exists());
+            let mut reloaded = Machine::load(dir, &RuntimeConfig::quiet_console())?;
+            assert_eq!(reloaded.root_hash()?, expected_root);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_and_rename_stored_reject_invalid_and_missing_paths() {
+        let tmp = tempfile::tempdir().expect("failed creating a temp dir");
+        let missing = tmp.path().join("missing");
+        let destination = tmp.path().join("destination");
+
+        let error = Machine::sync_stored(Path::new(""))
+            .expect_err("an empty stored-machine path must be invalid");
+        assert_eq!(error.code, constants::error_code::INVALID_ARGUMENT);
+        assert!(error.message.contains("directory name cannot be empty"));
+
+        let error = Machine::rename_stored(Path::new(""), &destination)
+            .expect_err("an empty rename source must be invalid");
+        assert_eq!(error.code, constants::error_code::INVALID_ARGUMENT);
+        assert!(error.message.contains("directory name cannot be empty"));
+
+        let error = Machine::rename_stored(&missing, Path::new(""))
+            .expect_err("an empty rename destination must be invalid");
+        assert_eq!(error.code, constants::error_code::INVALID_ARGUMENT);
+        assert!(error.message.contains("directory name cannot be empty"));
+
+        let error =
+            Machine::sync_stored(&missing).expect_err("syncing a missing stored machine must fail");
+        assert_eq!(error.code, constants::error_code::RUNTIME_ERROR);
+        assert!(error.message.contains("unable to read file"));
+
+        let error = Machine::rename_stored(&missing, &destination)
+            .expect_err("renaming a missing stored machine must fail");
+        assert_eq!(error.code, constants::error_code::RUNTIME_ERROR);
+        assert!(error.message.contains("unable to read file"));
+        assert!(!destination.exists());
+    }
+
+    /// A SharingMode::All load owns its directory for its lifetime (the
+    /// emulator's advisory locks): cloning it must fail until the
+    /// machine drops. And remove_stored deletes a stored machine
+    /// wholesale.
+    #[test]
+    fn test_clone_stored_locked_while_loaded_shared() -> Result<()> {
+        let tmp = tempfile::tempdir().expect("failed creating a temp dir");
+        let stored = tmp.path().join("stored");
+        let blocked = tmp.path().join("blocked");
+        let after = tmp.path().join("after");
+
+        let config = make_basic_machine_config();
+        let mut machine = create_machine(&config)?;
+        machine.run(1_000_000)?;
+        machine.store(&stored)?;
+        drop(machine);
+
+        {
+            let _held = Machine::load_with_sharing(
+                &stored,
+                &RuntimeConfig::quiet_console(),
+                SharingMode::All,
+            )?;
+            assert!(
+                Machine::clone_stored(&stored, &blocked).is_err(),
+                "cloning a directory loaded SharingMode::All must fail"
+            );
+        }
+
+        // A fresh destination after the drop: the failed attempt may
+        // leave partial files behind, but the lock is gone.
+        Machine::clone_stored(&stored, &after)?;
+        assert!(after.join("config.json").exists());
+
+        Machine::remove_stored(&after)?;
+        assert!(!after.exists());
+
+        Ok(())
+    }
+
+    /// The yield program awaiting its first input. It rejects every input
+    /// after about a million big cycles of shell work, reverting to this
+    /// state. Hashes serially: the collectors and the stepping references
+    /// hash a few dirty words per uarch cycle.
+    fn yield_machine() -> Result<Machine> {
+        let mut runtime = RuntimeConfig::quiet_console();
+        runtime.concurrency.update_hash_tree = 1;
+        Machine::load(Path::new(&test_image("yield")), &runtime)
+    }
+
+    /// Delivers an input, recording the pre-input root (returned) as the
+    /// revert root.
+    fn feed(machine: &mut Machine) -> Result<Hash> {
+        let root = machine.root_hash()?;
+        machine.send_cmio_response(CmioResponseReason::Advance, b"collect", Some(&root))?;
+        Ok(root)
+    }
+
+    /// Runs the big machine to `mcycle` exactly; the yield program produces
+    /// no automatic yields before its rejection.
+    fn run_to(machine: &mut Machine, mcycle: u64) -> Result<()> {
+        assert_eq!(
+            machine.run(mcycle)?,
+            constants::break_reason::REACHED_TARGET_MCYCLE
+        );
+        Ok(())
+    }
+
+    /// The mcycle at which the fed input is rejected.
+    fn rejection_mcycle() -> Result<u64> {
+        let mut machine = yield_machine()?;
+        feed(&mut machine)?;
+        assert_eq!(
+            machine.run(u64::MAX)?,
+            constants::break_reason::YIELDED_MANUALLY
+        );
+        assert_eq!(
+            machine.receive_cmio_request()?.reason(),
+            constants::cmio::tohost::manual::RX_REJECTED
+        );
+        machine.mcycle()
+    }
+
+    /// One mcycle by hand: the root after each uarch cycle up to and
+    /// including the one that halts the uarch, then the root after the
+    /// reset. The collectors' unbundled period layout.
+    fn stepped_period(machine: &mut Machine) -> Result<Vec<Hash>> {
+        let mut hashes = vec![];
+        loop {
+            let ucycle = machine.ucycle()?;
+            machine.run_uarch(ucycle + 1)?;
+            hashes.push(machine.root_hash()?);
+            if machine.uarch_halt_flag()? {
+                break;
+            }
+        }
+        machine.reset_uarch()?;
+        hashes.push(machine.root_hash()?);
+        Ok(hashes)
+    }
+
+    /// The machine's idle period while awaiting input: the revert tail
+    /// every later collection over an input needs.
+    fn revert_tail(machine: &mut Machine) -> Result<Vec<Hash>> {
+        let mcycle = machine.mcycle()?;
+        let root = machine.root_hash()?;
+        let tail = machine.collect_uarch_cycle_root_hashes(mcycle, 0, None)?;
+        assert_eq!(tail.break_reason, constants::break_reason::YIELDED_MANUALLY);
+        assert_eq!(tail.periods().count(), 1);
+        assert_eq!(tail.hashes.last(), Some(&root), "an idle period restores");
+        assert_eq!((machine.mcycle()?, machine.root_hash()?), (mcycle, root));
+        Ok(tail.hashes)
+    }
+
+    fn concat_uarch(parts: &[UarchCycleRootHashes]) -> Vec<Vec<Hash>> {
+        parts
+            .iter()
+            .flat_map(|part| part.periods().map(<[Hash]>::to_vec))
+            .collect()
+    }
+
+    #[test]
+    fn mcycle_collection_samples_the_big_machine_and_continues_across_calls() -> Result<()> {
+        const LOG2_PERIOD: u64 = 12;
+        let end = rejection_mcycle()?;
+
+        let mut reference = yield_machine()?;
+        let revert_root = feed(&mut reference)?;
+        let start = reference.mcycle()?;
+        let mut expected = vec![];
+        let mut sample = start + (1 << LOG2_PERIOD);
+        while sample < end {
+            run_to(&mut reference, sample)?;
+            expected.push(reference.root_hash()?);
+            sample += 1 << LOG2_PERIOD;
+        }
+        // The rejection is a fixed point; it contributes the revert root.
+        expected.push(revert_root);
+
+        let mut machine = yield_machine()?;
+        feed(&mut machine)?;
+        let one_shot = machine.collect_mcycle_root_hashes(u64::MAX, LOG2_PERIOD, 0, 0, None)?;
+        assert_eq!(one_shot.hashes, expected);
+        assert_eq!(
+            one_shot.break_reason,
+            constants::break_reason::YIELDED_MANUALLY
+        );
+        assert_eq!(one_shot.partial_bundle, None);
+        let final_root = machine.root_hash()?;
+
+        // Unbundled and bundled, calls split off the sampling grid continue
+        // with the returned phase and partial bundle.
+        for log2_bundle in [0, 3] {
+            let mut machine = yield_machine()?;
+            feed(&mut machine)?;
+            let one_shot =
+                machine.collect_mcycle_root_hashes(u64::MAX, LOG2_PERIOD, 0, log2_bundle, None)?;
+
+            let mut machine = yield_machine()?;
+            feed(&mut machine)?;
+            let (mut hashes, mut phase, mut bundle) = (vec![], 0, None);
+            for split in [start + 5_000, start + 300_001, u64::MAX] {
+                let part = machine.collect_mcycle_root_hashes(
+                    split,
+                    LOG2_PERIOD,
+                    phase,
+                    log2_bundle,
+                    bundle.as_ref(),
+                )?;
+                hashes.extend(part.hashes);
+                (phase, bundle) = (part.mcycle_phase, part.partial_bundle);
+            }
+            assert_eq!(hashes, one_shot.hashes, "bundle 2^{log2_bundle}");
+            assert_eq!(machine.root_hash()?, final_root);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uarch_collection_matches_stepping_and_continues_across_calls() -> Result<()> {
+        const MCYCLES: u64 = 48;
+
+        let mut reference = yield_machine()?;
+        let idle = stepped_period(&mut reference)?;
+        let tail = revert_tail(&mut yield_machine()?)?;
+        assert_eq!(tail, idle);
+
+        feed(&mut reference)?;
+        let start = reference.mcycle()?;
+        let expected = (0..MCYCLES)
+            .map(|_| stepped_period(&mut reference))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut machine = yield_machine()?;
+        feed(&mut machine)?;
+        let one_shot = machine.collect_uarch_cycle_root_hashes(start + MCYCLES, 0, Some(&tail))?;
+        assert_eq!(
+            one_shot.break_reason,
+            constants::break_reason::REACHED_TARGET_MCYCLE
+        );
+        assert_eq!(concat_uarch(&[one_shot]), expected);
+        assert_eq!(machine.root_hash()?, reference.root_hash()?);
+
+        for log2_bundle in [0, 3] {
+            let mut machine = yield_machine()?;
+            feed(&mut machine)?;
+            let one_shot = machine.collect_uarch_cycle_root_hashes(
+                start + MCYCLES,
+                log2_bundle,
+                Some(&tail),
+            )?;
+
+            let mut machine = yield_machine()?;
+            feed(&mut machine)?;
+            let parts = [7, 30, MCYCLES]
+                .into_iter()
+                .map(|end| {
+                    machine.collect_uarch_cycle_root_hashes(start + end, log2_bundle, Some(&tail))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            assert_eq!(
+                concat_uarch(&parts),
+                concat_uarch(&[one_shot]),
+                "bundle 2^{log2_bundle}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uarch_collection_substitutes_the_revert_root_at_a_rejection() -> Result<()> {
+        let end = rejection_mcycle()?;
+        let tail = revert_tail(&mut yield_machine()?)?;
+
+        let mut reference = yield_machine()?;
+        let revert_root = feed(&mut reference)?;
+        run_to(&mut reference, end - 2)?;
+        let before = stepped_period(&mut reference)?;
+        let rejecting = stepped_period(&mut reference)?;
+
+        let mut machine = yield_machine()?;
+        feed(&mut machine)?;
+        run_to(&mut machine, end - 2)?;
+        let collected = machine.collect_uarch_cycle_root_hashes(u64::MAX, 0, Some(&tail))?;
+        assert_eq!(
+            collected.break_reason,
+            constants::break_reason::YIELDED_MANUALLY
+        );
+        let periods: Vec<&[Hash]> = collected.periods().collect();
+        assert_eq!(periods.len(), 3, "two executed mcycles, then the tail");
+        assert_eq!(periods[0], before);
+        // The physical reset keeps the rejected state; the collector
+        // reports the canonical revert root instead.
+        let (last, executed) = periods[1].split_last().unwrap();
+        assert_eq!(executed, &rejecting[..rejecting.len() - 1]);
+        assert_eq!(*last, revert_root);
+        assert_ne!(rejecting.last(), Some(&revert_root));
+        assert_eq!(periods[2], tail);
+
+        // Starting at the rejection, the call returns the reverted period
+        // alone, and needs the tail to do so.
+        assert!(
+            machine
+                .collect_uarch_cycle_root_hashes(end, 0, None)
+                .is_err()
+        );
+        let again = machine.collect_uarch_cycle_root_hashes(end, 0, Some(&tail))?;
+        assert_eq!(concat_uarch(&[again]), vec![tail]);
+        Ok(())
+    }
+
+    #[test]
+    fn uarch_collection_refuses_to_execute_without_the_revert_tail() -> Result<()> {
+        let mut machine = yield_machine()?;
+        feed(&mut machine)?;
+        let (mcycle, root) = (machine.mcycle()?, machine.root_hash()?);
+
+        let error = machine
+            .collect_uarch_cycle_root_hashes(mcycle + 1, 0, None)
+            .unwrap_err();
+        assert!(error.message.contains("revert uarch tail"), "{error:?}");
+        let error = machine
+            .collect_uarch_cycle_root_hashes(mcycle + 1, 0, Some(&[root, [7; 32]]))
+            .unwrap_err();
+        assert!(error.message.contains("revert root hash"), "{error:?}");
+        assert_eq!((machine.mcycle()?, machine.root_hash()?), (mcycle, root));
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_bundles_are_refused_before_the_call() -> Result<()> {
+        let mut machine = yield_machine()?;
+        let tail = revert_tail(&mut machine)?;
+        feed(&mut machine)?;
+        let (mcycle, root) = (machine.mcycle()?, machine.root_hash()?);
+
+        let uarch = machine.collect_uarch_cycle_root_hashes(mcycle + 1, 21, Some(&tail));
+        assert_eq!(
+            uarch.unwrap_err().code,
+            constants::error_code::INVALID_ARGUMENT
+        );
+        let big = machine.collect_mcycle_root_hashes(mcycle + 1, 0, 0, 64, None);
+        assert_eq!(
+            big.unwrap_err().code,
+            constants::error_code::INVALID_ARGUMENT
+        );
+        assert_eq!((machine.mcycle()?, machine.root_hash()?), (mcycle, root));
+
+        // The largest sizes are accepted.
+        machine.collect_uarch_cycle_root_hashes(mcycle + 1, 20, Some(&tail))?;
+        Ok(())
+    }
+
+    #[test]
+    fn collections_ending_at_the_current_mcycle_off_a_fixed_point_are_empty() -> Result<()> {
+        let mut machine = yield_machine()?;
+        feed(&mut machine)?;
+        let mcycle = machine.mcycle()?;
+
+        let uarch = machine.collect_uarch_cycle_root_hashes(mcycle, 3, None)?;
+        assert!(uarch.hashes.is_empty());
+        assert_eq!(uarch.mcycle_hash_offsets, vec![0]);
+        assert_eq!(
+            uarch.break_reason,
+            constants::break_reason::REACHED_TARGET_MCYCLE
+        );
+
+        let big = machine.collect_mcycle_root_hashes(mcycle, 10, 0, 3, None)?;
+        assert!(big.hashes.is_empty());
+        assert_eq!(big.partial_bundle, None);
+        assert_eq!(machine.mcycle()?, mcycle);
+        Ok(())
+    }
+}

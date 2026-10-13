@@ -1,0 +1,9 @@
+# Sampo configuration
+# https://github.com/bruits/sampo/blob/main/crates/sampo/README.md#configuration
+version = 1
+
+[git]
+default_branch = "main"
+
+[github]
+repository = "cartesi/rollups-rs"
