@@ -3,9 +3,14 @@
 pub use alloy_primitives;
 pub use alloy_sol_types;
 
-use alloy_primitives::{Address, U256};
 use alloy_sol_types::sol;
-use std::fmt;
+
+mod deposit;
+
+pub use deposit::{
+    DepositDecodeError, Erc20Deposit, Erc721Deposit, Erc1155BatchDeposit, Erc1155SingleDeposit,
+    EtherDeposit,
+};
 
 sol! {
     /// @notice An advance request from an EVM-compatible blockchain to a Cartesi Machine.
@@ -55,124 +60,6 @@ sol! {
     /// libraries—encodes a function call
     #[derive(Debug, PartialEq, Eq)]
     function DelegateCallVoucher(address destination, bytes calldata payload) external;
-
-    /// @notice Encode an Ether deposit.
-    /// @param sender The Ether sender
-    /// @param value The amount of Wei being sent
-    /// @param execLayerData Additional data to be interpreted by the execution layer
-    /// @return The encoded input payload
-    #[derive(Debug, PartialEq, Eq)]
-    function encodeEtherDeposit(
-        address sender,
-        uint256 value,
-        bytes calldata execLayerData
-    ) internal pure returns (bytes memory) {
-        return abi.encodePacked(
-            sender, //              20B
-            value, //               32B
-            execLayerData //        arbitrary size
-        );
-    }
-
-    /// @notice Encode an ERC-20 token deposit.
-    /// @param token The token contract
-    /// @param sender The token sender
-    /// @param value The amount of tokens being sent
-    /// @param execLayerData Additional data to be interpreted by the execution layer
-    /// @return The encoded input payload
-    #[derive(Debug, PartialEq, Eq)]
-    function encodeERC20Deposit(
-        address token,
-        address sender,
-        uint256 value,
-        bytes calldata execLayerData
-    ) internal pure returns (bytes memory) {
-        return abi.encodePacked(
-            token, //               20B
-            sender, //              20B
-            value, //               32B
-            execLayerData //        arbitrary size
-        );
-    }
-
-    /// @notice Encode an ERC-721 token deposit.
-    /// @param token The token contract
-    /// @param sender The token sender
-    /// @param tokenId The token identifier
-    /// @param baseLayerData Additional data to be interpreted by the base layer
-    /// @param execLayerData Additional data to be interpreted by the execution layer
-    /// @return The encoded input payload
-    /// @dev `baseLayerData` should be forwarded to `token`.
-    #[derive(Debug, PartialEq, Eq)]
-    function encodeERC721Deposit(
-        address token,
-        address sender,
-        uint256 tokenId,
-        bytes calldata baseLayerData,
-        bytes calldata execLayerData
-    ) internal pure returns (bytes memory) {
-        bytes memory data = abi.encode(baseLayerData, execLayerData);
-        return abi.encodePacked(
-            token, //               20B
-            sender, //              20B
-            tokenId, //             32B
-            data //                 arbitrary size
-        );
-    }
-
-    /// @notice Encode an ERC-1155 single token deposit.
-    /// @param token The ERC-1155 token contract
-    /// @param sender The token sender
-    /// @param tokenId The identifier of the token being transferred
-    /// @param value Transfer amount
-    /// @param baseLayerData Additional data to be interpreted by the base layer
-    /// @param execLayerData Additional data to be interpreted by the execution layer
-    /// @return The encoded input payload
-    /// @dev `baseLayerData` should be forwarded to `token`.
-    #[derive(Debug, PartialEq, Eq)]
-    function encodeSingleERC1155Deposit(
-        address token,
-        address sender,
-        uint256 tokenId,
-        uint256 value,
-        bytes calldata baseLayerData,
-        bytes calldata execLayerData
-    ) internal pure returns (bytes memory) {
-        bytes memory data = abi.encode(baseLayerData, execLayerData);
-        return abi.encodePacked(
-            token, //               20B
-            sender, //              20B
-            tokenId, //             32B
-            value, //               32B
-            data //                 arbitrary size
-        );
-    }
-
-    /// @notice Encode an ERC-1155 batch token deposit.
-    /// @param token The ERC-1155 token contract
-    /// @param sender The token sender
-    /// @param tokenIds The identifiers of the tokens being transferred
-    /// @param values Transfer amounts per token type
-    /// @param baseLayerData Additional data to be interpreted by the base layer
-    /// @param execLayerData Additional data to be interpreted by the execution layer
-    /// @return The encoded input payload
-    /// @dev `baseLayerData` should be forwarded to `token`.
-    #[derive(Debug, PartialEq, Eq)]
-    function encodeBatchERC1155Deposit(
-        address token,
-        address sender,
-        uint256[] calldata tokenIds,
-        uint256[] calldata values,
-        bytes calldata baseLayerData,
-        bytes calldata execLayerData
-    ) internal pure returns (bytes memory) {
-        bytes memory data = abi.encode(tokenIds, values, baseLayerData, execLayerData);
-        return abi.encodePacked(
-            token, //                   20B
-            sender, //                  20B
-            data //                     arbitrary size
-        );
-    }
 }
 
 sol! {
@@ -185,54 +72,5 @@ sol! {
 pub type Input = EvmAdvanceCall;
 pub type Voucher = VoucherCall;
 pub type Notice = NoticeCall;
+pub type DelegateCallVoucher = DelegateCallVoucherCall;
 pub type Erc20Transfer = IERC20::transferCall;
-
-pub const ERC20_DEPOSIT_PREFIX_BYTES: usize = 20 + 20 + 32;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Erc20Deposit {
-    pub token: Address,
-    pub sender: Address,
-    pub value: U256,
-    pub exec_layer_data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Erc20DepositDecodeError {
-    PayloadTooShort {
-        expected_at_least: usize,
-        got: usize,
-    },
-}
-
-impl fmt::Display for Erc20DepositDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PayloadTooShort {
-                expected_at_least,
-                got,
-            } => write!(
-                f,
-                "ERC-20 deposit payload too short: expected at least {expected_at_least} bytes, got {got}"
-            ),
-        }
-    }
-}
-
-impl Erc20Deposit {
-    pub fn decode(payload: &[u8]) -> Result<Self, Erc20DepositDecodeError> {
-        if payload.len() < ERC20_DEPOSIT_PREFIX_BYTES {
-            return Err(Erc20DepositDecodeError::PayloadTooShort {
-                expected_at_least: ERC20_DEPOSIT_PREFIX_BYTES,
-                got: payload.len(),
-            });
-        }
-
-        Ok(Self {
-            token: Address::from_slice(&payload[0..20]),
-            sender: Address::from_slice(&payload[20..40]),
-            value: U256::from_be_slice(&payload[40..72]),
-            exec_layer_data: payload[72..].to_vec(),
-        })
-    }
-}
