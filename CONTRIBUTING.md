@@ -3,7 +3,10 @@
 ## Development
 
 You need a stable Rust toolchain, `make`, a C compiler and `libclang` (for
-bindgen).
+bindgen). The machine crates also need the Cartesi Machine emulator v0.21
+installed (see [`cartesi-machine-sys`](crates/cartesi-machine-sys/README.md)).
+Their tests boot images you prepare once with the `cartesi-machine` CLI, by
+running `scripts/prepare-test-images.sh`.
 
 ```sh
 cargo fmt --all --check

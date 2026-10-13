@@ -30,6 +30,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
+      # `cargo publish` builds each crate, and cartesi-machine-sys links the
+      # installed emulator.
+      - uses: ./.github/actions/install-cartesi-machine
 
       # Pending changesets mean this run only prepares the release pull
       # request; without them, Sampo publishes whatever is unpublished.

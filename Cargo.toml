@@ -14,6 +14,8 @@ repository = "https://github.com/cartesi/rollups-rs"
 # Workspace crates
 cartesi-codec = { version = "0.1.0", path = "crates/cartesi-codec" }
 cartesi-libcmt-sys = { version = "0.1.0", path = "crates/cartesi-libcmt-sys" }
+cartesi-machine = { version = "0.21.0", path = "crates/cartesi-machine" }
+cartesi-machine-sys = { version = "0.21.0", path = "crates/cartesi-machine-sys" }
 cartesi-rollup = { version = "0.1.0", path = "crates/cartesi-rollup" }
 
 # External crates

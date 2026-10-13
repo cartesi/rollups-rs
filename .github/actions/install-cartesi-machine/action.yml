@@ -1,0 +1,39 @@
+name: Install Cartesi Machine
+description: Install the pinned machine-emulator release package and its link dependencies.
+
+inputs:
+  version:
+    description: machine-emulator release tag
+    default: v0.21.0
+  sha256-amd64:
+    description: SHA-256 of the amd64 .deb
+    default: 5f13034f43454c340062c677146daabe77c587cee1bd60342c95b8ad8f1463a3
+  sha256-arm64:
+    description: SHA-256 of the arm64 .deb
+    default: 866f0bde2db53b9b8e6a6eac85e5ad4116338379fa25cdfcc5e4bf835f948bb1
+
+runs:
+  using: composite
+  steps:
+    - name: Install Cartesi Machine
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        SHA256_AMD64: ${{ inputs.sha256-amd64 }}
+        SHA256_ARM64: ${{ inputs.sha256-arm64 }}
+      run: |
+        set -euo pipefail
+        arch="$(dpkg --print-architecture)"
+        case "$arch" in
+          amd64) sha256="$SHA256_AMD64" ;;
+          arm64) sha256="$SHA256_ARM64" ;;
+          *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+        esac
+        curl -fsSL --retry 3 -o /tmp/machine-emulator.deb \
+          "https://github.com/cartesi/machine-emulator/releases/download/${VERSION}/machine-emulator_${arch}.deb"
+        echo "${sha256}  /tmp/machine-emulator.deb" | sha256sum --check
+        sudo apt-get update
+        # The release archive references libslirp.
+        sudo apt-get install -y /tmp/machine-emulator.deb libslirp-dev
+        rm -f /tmp/machine-emulator.deb
+        cartesi-machine --version

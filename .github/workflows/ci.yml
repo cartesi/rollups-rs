@@ -40,8 +40,17 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/install-cartesi-machine
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: test-images
+          key: test-images-${{ runner.os }}-${{ hashFiles('scripts/prepare-test-images.sh', '.github/actions/install-cartesi-machine/action.yml') }}
+      - name: Prepare test images
+        run: scripts/prepare-test-images.sh
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy (remote_machine)
+        run: cargo clippy -p cartesi-machine --features remote_machine --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
       - name: Docs
@@ -65,6 +74,7 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/install-cartesi-machine
       - run: cargo check --workspace --all-targets --locked
 
   guest:
